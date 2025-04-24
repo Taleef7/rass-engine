@@ -1,0 +1,8 @@
+{
+	"dependencies": {
+		"@langchain/openai": "^0.5.7",
+		"@langchain/community": "^0.3.41",
+		"zod": "^3.24.3",
+		"@opensearch-project/opensearch": "^3.5.1"
+	}
+}

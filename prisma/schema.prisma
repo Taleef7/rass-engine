@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model issues {
+  id            Int       @id
+  project_id    Int
+  tracker_id    Int
+  status_id     Int
+  priority_id   Int
+  author_id     Int
+  subject       String
+  description   String?
+  created_on    DateTime
+  updated_on    DateTime
+  projects      projects? @relation(fields: [project_id], references: [id])
+  trackers      trackers? @relation(fields: [tracker_id], references: [id])
+  issue_statuses issue_statuses? @relation(fields: [status_id], references: [id])
+  enumerations  enumerations? @relation(fields: [priority_id], references: [id])
+  users         users?    @relation(fields: [author_id], references: [id])
+  journals      journals[]
+  attachments   attachments[]
+}
+
+model projects {
+  id            Int       @id
+  name          String
+  issues        issues[]
+}
+
+model trackers {
+  id            Int       @id
+  name          String
+  issues        issues[]
+}
+
+model issue_statuses {
+  id            Int       @id
+  name          String
+  issues        issues[]
+}
+
+model enumerations {
+  id            Int       @id
+  name          String
+  issues        issues[]
+}
+
+model users {
+  id            Int       @id
+  login         String
+  issues        issues[]
+  journals      journals[]
+}
+
+model journals {
+  id            Int       @id
+  journalized_id Int
+  journalized_type String
+  user_id       Int
+  notes         String?
+  created_on    DateTime
+  users         users?    @relation(fields: [user_id], references: [id])
+}
+
+model attachments {
+  id            Int       @id
+  container_id  Int
+  container_type String
+  filename      String
+  disk_filename String
+  filesize      Int
+  content_type  String?
+  created_on    DateTime
+  author_id     Int
+  issues        issues?   @relation(fields: [container_id], references: [id])
+}
