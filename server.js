@@ -17,8 +17,8 @@ dotenv.config();
 const app = express();
 const prisma = new PrismaClient();
 const openai = new OpenAI({
-    apiKey: process.env.BLUEHIVE_BEARER_TOKEN,
-    baseURL: process.env.BLUEHIVEAI_URL,
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_URL,
 });
 
 // OpenSearch client setup
@@ -29,9 +29,9 @@ const osClient = new Client({
 
 // LangChain memory setup
 const embeddings = new OpenAIEmbeddings({
-    openAIApiKey: process.env.BLUEHIVE_BEARER_TOKEN,
-    configuration: { baseURL: process.env.BLUEHIVEAI_URL },
-    modelName: process.env.OLLAMA_EMBED_MODEL || 'text-embedding-3-large',
+    openAIApiKey: process.env.OPENAI_API_KEY,
+    configuration: { baseURL: process.env.OPENAI_EMBEDDINGS_URL },
+    modelName: process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-large',
 });
 const vectorStore = new MemoryVectorStore(embeddings);
 const memory = new VectorStoreRetrieverMemory({
@@ -60,8 +60,8 @@ const authenticateUser = async (req, res, next) => {
     }
     const token = authHeader.split(' ')[1];
     try {
-        // Mock user validation (replace with actual user service)
-        if (token !== process.env.BLUEHIVE_BEARER_TOKEN) {
+        // Mock user validation
+        if (token !== process.env.BEARER_TOKEN) {
             throw new Error('Invalid token');
         }
         req.user = { id: req.body.user_id || req.query.user_id };
@@ -720,7 +720,7 @@ wss.on('connection', async (ws, request) => {
             return;
         }
         const token = authHeader.split(' ')[1];
-        if (token !== process.env.BLUEHIVE_BEARER_TOKEN) {
+        if (token !== process.env.BEARER_TOKEN) {
             ws.send(JSON.stringify({ error: 'Authentication failed' }));
             ws.close();
             return;
