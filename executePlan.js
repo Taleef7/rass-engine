@@ -112,7 +112,21 @@ async function injectChainedIds(queryBody, deps, results, indexName, osClient) {
 
 async function gatherAllHits(osClient, indexName, body) {
     const hits = [];
-    const first = await osClient.search({ index: indexName, body, scroll: '90s' });
+    // const first = await osClient.search({ index: indexName, body, scroll: '90s' });
+
+    let first;
+    try {
+        first = await osClient.search({ index: indexName, body, scroll: '90s' });
+    } catch (err) {
+        if (err.meta?.body?.error?.type === 'index_not_found_exception') {
+            console.warn(`OpenSearch index not found: ${index}`);
+            return { "Error": "No such index found." };  // Return empty map if index doesn't exist
+        } else {
+            throw err;  // rethrow unknown errors
+        }
+    }
+
+
     hits.push(...first.hits.hits);
 
     let sid = first._scroll_id;

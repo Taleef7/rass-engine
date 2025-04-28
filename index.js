@@ -21,12 +21,25 @@ const {
     JWT_SECRET,                          //  HS256 secret or RSA/EdDSA public key
     OPENSEARCH_HOST = 'localhost',
     OPENSEARCH_PORT = 9200,
-    OPENSEARCH_INDEX_NAME = 'rass_docs',
+    OPENSEARCH_INDEX_NAME = 'redmine_index',
     BEARER_TOKEN_FALLBACK,               // keep old header-token for scripts optionally
     EMBED_DIM = 3072,
     SHARD_COUNT = 1,
     REPLICA_COUNT = 0,
 } = process.env;
+
+process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught Exception:', err.stack || err);
+    // graceful shutdown
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+    // graceful shutdown
+    process.exit(1);
+});
+
 
 const app = express();
 
@@ -154,6 +167,13 @@ async function ask(query) {
     return { documents };
 }
 
+// Global error middleware for HTTP
+app.use((err, req, res, next) => {
+    console.error('Global Express Error Handler:', err.stack || err);
+    res.status(err.status || 500).json({ error: err.message || 'Internal Server Error' });
+});
+
+
 /* ───────────────── REST: POST /ask ────────────────────── */
 app.post('/ask', async (req, res) => {
     try {
@@ -183,6 +203,7 @@ wss.on('connection', (ws, req) => {
             if (!query) throw new Error('Missing query');
             ws.send(JSON.stringify(await ask(query)));
         } catch (e) {
+            console.error('WebSocket Message Error:', e.stack || e);
             ws.send(JSON.stringify({ error: e.message }));
         } finally {
             ws.close();
