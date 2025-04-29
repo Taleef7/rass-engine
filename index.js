@@ -23,19 +23,20 @@ const {
     OPENSEARCH_PORT = 9200,
     OPENSEARCH_INDEX_NAME = 'redmine_index',
     BEARER_TOKEN_FALLBACK,               // keep old header-token for scripts optionally
-    EMBED_DIM = 3072,
+    OPENAI_EMBED_MODEL = 'text-embedding-ada-002',
+    EMBED_DIM = 1024,
     SHARD_COUNT = 1,
     REPLICA_COUNT = 0,
 } = process.env;
 
 process.on('uncaughtException', (err) => {
-    console.error('💥 Uncaught Exception:', err.stack || err);
+    console.error('Uncaught Exception:', err.stack || err);
     // graceful shutdown
     process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
     // graceful shutdown
     process.exit(1);
 });
@@ -88,7 +89,10 @@ app.use(express.json());
 /* ───────────────── index bootstrap (single index) ────────────────── */
 async function ensureIndexExists() {
     const exists = await osClient.indices.exists({ index: OPENSEARCH_INDEX_NAME });
-    if (exists) return;
+    if (exists) {
+        console.log(`Index ${OPENSEARCH_INDEX_NAME} already exists`);
+        return;
+    }
 
     await osClient.indices.create({
         index: OPENSEARCH_INDEX_NAME,
@@ -124,13 +128,12 @@ async function ensureIndexExists() {
     });
     console.log(`Created index ${OPENSEARCH_INDEX_NAME}`);
 }
-ensureIndexExists().catch(console.error);
 
 /* ───────────────── embedding helper ──────────────────── */
 async function embedText(text) {
     if (!text.trim()) return Array(Number(EMBED_DIM)).fill(0);
     const { data } = await openai.embeddings.create({
-        model: process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-large',
+        model: OPENAI_EMBED_MODEL,
         input: text,
     });
     return data[0].embedding;
@@ -211,13 +214,23 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-/* ─────────── HTTP→WS upgrade (only /ws/ask path) ─────── */
-const server = app.listen(8000, () => console.log('API on http://localhost:8000'));
-server.on('upgrade', (req, socket, head) => {
-    if (req.url === '/ws/ask') {
-        wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-    } else socket.destroy();
-});
+/* ─────────── HTTP→WS upgrade (only /ws/ask path) and server start ─────── */
+async function startServer() {
+    try {
+        await ensureIndexExists();
+        const server = app.listen(8000, () => console.log('API on http://localhost:8000'));
+        server.on('upgrade', (req, socket, head) => {
+            if (req.url === '/ws/ask') {
+                wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+            } else socket.destroy();
+        });
+    } catch (e) {
+        console.error('Failed to ensure index or start server:', e);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 /* ───────────────── graceful shutdown ─────────────────── */
 process.on('SIGTERM', () => {
