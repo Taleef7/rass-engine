@@ -119,8 +119,8 @@ async function gatherAllHits(osClient, indexName, body) {
         first = await osClient.search({ index: indexName, body, scroll: '90s' });
     } catch (err) {
         if (err.meta?.body?.error?.type === 'index_not_found_exception') {
-            console.warn(`OpenSearch index not found: ${index}`);
-            return { "Error": "No such index found." };  // Return empty map if index doesn't exist
+            console.warn(`OpenSearch index not found: ${indexName}`);
+            return [];
         } else {
             throw err;  // rethrow unknown errors
         }

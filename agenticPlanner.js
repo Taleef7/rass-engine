@@ -47,6 +47,12 @@ async function planAndExecute({
         }));
         history.push(...summary);
 
+        /* New patch to handle empty results early */
+        const allHitCountsZero = summary.every(s => s.hit_count === 0);
+        if (allHitCountsZero) {
+            throw new Error(`No matching documents found for the query.`);
+        }
+
         /* Ask the LLM if we are DONE */
         const covered = await checkCoverage({
             openai,
@@ -58,7 +64,7 @@ async function planAndExecute({
         }
     }
 
-    throw new Error(
+    console.warn(
         `Agent exited after ${MAX_AGENT_ITER} iterations – query may still be incomplete`,
     );
 }
