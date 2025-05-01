@@ -1,233 +1,220 @@
-/**********************************************************************
- * agenticPlanner.js – robust planner for OpenSearch RAG
- *  • Uses OpenAI to generate multi-step DSL plans
- *  • Auto-repairs empty / bad plans with smart fallbacks
- *********************************************************************/
-const MAX_AGENT_ITER = 6;
-const MAX_PLAN_STEPS = 15;
-
-const PLAN_GEN_FN = 'generate_query_plan';
-const COVERAGE_FN = 'evaluate_coverage';
+const MAX_ITER = 6;
 const DEFAULT_K = Number(process.env.DEFAULT_K || 25);
+const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
 
-/* ------------ helper to create a semantic knn step --------------- */
-function semanticStep(stepId, k = DEFAULT_K) {
-    return {
-        step_id: stepId,
-        purpose: 'semantic similarity fallback',
-        requires_embedding: true,
-        depends_on: [],
-        is_final: true,
-        query_body: {
-            _source: ['doc_id', 'file_path', 'attachment_content'],
-            size: k,
-            query: {
-                knn: {
-                    embedding: { vector: [], k }
-                }
-            }
-        }
-    };
+const log = (...a) => console.log(...a);
+const warn = (...a) => console.warn(...a);
+
+/**
+ * Convert a natural-language request into an ANN-only plan
+ * understood by `runSteps`.
+ *
+ * Output schema:
+ * {
+ *   intent:   string[],
+ *   entities: [{ text, type }],
+ *   expansions: { <entity>: string[] },
+ *   plan: [{ step_id, search_term, knn_k, is_final }]
+ * }
+ */
+async function buildPlan(openai, query, history = []) {
+  const sysPrompt = `
+You are an expert OpenSearch strategist.  
+The index schema is **immutable**:
+
+mappings: {
+  properties: {
+    doc_id     : { type: keyword },
+    file_path  : { type: keyword },
+    file_type  : { type: keyword },
+    text_chunk : { type: text    },
+    embedding  : { type: knn_vector, dimension: ${EMBED_DIM},
+                   method: { name: hnsw, engine: nmslib,
+                             space_type: cosinesimil,
+                             parameters: { m: 48, ef_construction: 400 } } }
+  }
 }
 
-/* ---------- helper to create a fuzzy / prefix text step ---------- */
-function prefixStep(stepId, queryText, k = DEFAULT_K) {
-    return {
-        step_id: stepId,
-        purpose: 'fuzzy / prefix text fallback',
-        requires_embedding: false,
-        depends_on: [],
-        is_final: false,
-        query_body: {
-            _source: ['doc_id', 'file_path', 'attachment_content'],
-            size: k,
-            query: {
-                bool: {
-                    should: [
-                        { match_phrase_prefix: { attachment_content: queryText } },
-                        { wildcard: { attachment_content: `${queryText}*` } }
-                    ]
-                }
-            }
-        }
+### Your job
+1.  Detect the user **intent** (one short phrase).
+2.  Extract **named entities** – label each as
+    PERSON/PROPER NOUN, DATE, PLACE, MEDICAL_COND, ORG, ID, OTHER_TERM.
+3.  Produce up to three concise **expansions** per entity
+    (skip people, IDs, or ultra-specific proper nouns).
+4.  Craft an ANN-only **plan**:
+    • One 'search_term' per step (entity or expansion).  
+    • Choose 'knn_k' (10 for specific, up to 50 for broad).
+
+### Response
+Return **ONLY** valid JSON (no markdown). Use the schema above.
+
+### Examples
+(abridged for brevity – note the 'search_term' key and look at the first example for the JSON output structure)
+
+1. Query: *"get me records for Juli and the documents having the mention of terms containing Borne"*  
+   → intent: "find documents"
+   → entities: [{"text": "Juli", "type": "PERSON/PROPER NOUN"}, {"text": "Borne", "type": "PERSON/PROPER NOUN"}]
+   → expansions: {"Juli": [], "Borne": []} 
+   → **Your Output**:
+     {
+       "intent": ["find documents"],
+       "plan": [
+         {
+           "step_id": "e1",
+           "search_term": "Juli",
+           "knn_k": 10,
+         },
+         {
+           "step_id": "e2",
+           "search_term": "Borne",
+           "knn_k": 10,
+         }       
+        ]
+      }.
+
+2. Query: *"heart disease reports"*
+   → intent: ["find documents"]  
+   → entities: [{"text":"heart disease","type":"MEDICAL_COND"}]  
+   → expansions: {"heart disease":["cardiac disorder","cardiovascular disease"]}  
+   → plan: steps e1-e3 over those three terms, k=25.
+   → **Your Output**:
+     {
+       "intent": ["find documents"],
+       "plan": [
+         {
+           "step_id": "e1",
+           "search_term": "heart disease",
+           "knn_k": 10,
+         },
+         {
+           "step_id": "e2",
+           "search_term": "cardiac disorder",
+           "knn_k": 10,
+         },
+         ... cover all the expansions and entities like this ...       
+        ]
+      }.
+
+3. Query: *"COVID-19 cases in Seattle 2021"*  
+   → entities: COVID-19 (MEDICAL_COND), Seattle (PLACE), 2021 (DATE).  
+   → expansions only for COVID-19. Three steps, k=20/10/10.
+   Your output should again look like the example one and two's JSON.
+
+4. Query: *"Memorial Sloan Kettering diabetes 2023"*  
+   → entities ORG+MEDICAL_COND+DATE, expansions for diabetes. Five steps.
+   Your output should again look like the example one and two's JSON.
+
+5. Query: *"patients with hypertension and asthma in California after June 2024"*  
+   → hypertension, asthma, California, June 2024 (+ expansions). Six steps.
+   Your output should again look like the example one and two's JSON.
+
+6. Query: *"research on Alzheimer’s biomarkers"*  
+   → entities: Alzheimer’s (MEDICAL_COND), biomarkers (OTHER_TERM)  
+   → expansions for Alzheimer’s only. Two steps, k=25 each.
+   Your output should again look like the example one and two's JSON.
+
+Current Query: ${query}
+History: ${JSON.stringify(history)}
+`.trim();
+
+  const resp = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    temperature: 0.3,
+    max_tokens: 1500,
+    messages: [
+      { role: 'system', content: sysPrompt },
+      { role: 'user', content: `Query: ${query}\nHistory: ${JSON.stringify(history)}` }
+    ]
+  });
+
+  try {
+    return JSON.parse(resp?.choices[0]?.message?.content);
+  } catch (e) {
+    console.warn('[LLM] bad JSON, falling back:', e.message);
+    return {                                // emergency single-step plan
+      intent: ["find documents"],
+      entities: [{ text: query, type: "OTHER_TERM" }],
+      expansions: { [query]: [] },
+      plan: [{ step_id: "e1", search_term: query, knn_k: DEFAULT_K, is_final: true }]
     };
+  }
 }
 
-/* ----------------------------- main loop ------------------------- */
+
+/**
+ * REPL-style loop: build → run → decide if done.
+ * 'mappings' is optional; if supplied, we verify that the index
+ * matches the canonical schema once and warn otherwise.
+ */
 async function planAndExecute({
-    query,
-    openai,
-    osClient,
-    indexName,
-    mappings,
-    embedText,
-    runPlan
+  query,
+  openai,
+  osClient,
+  indexName,
+  mappings = null,       // optional
+  embedText,
+  runStepsFn   // injectable for tests
 }) {
-    const history = [];
-    let iteration = 0;
+  if (mappings) {
+    const allowed = ['doc_id', 'file_path', 'file_type', 'text_chunk', 'embedding'];
+    const bad = Object.keys(mappings.properties || {})
+      .filter(f => !allowed.includes(f));
+    if (bad.length) console.warn('[planAndExecute] unmapped fields:', bad);
+  }
 
-    while (iteration++ < MAX_AGENT_ITER) {
-
-        /* ---- 1. get plan from the LLM (may fail) ------------------- */
-        let plan = [];
-        try {
-            ({ plan } = await getPlanFromLLM({ openai, query, history }));
-        } catch (e) {
-            console.log('[planner] LLM returned no plan – building fallback.');
-        }
-
-        /* ---- 2. Fallback if plan empty or invalid ------------------ */
-        if (!Array.isArray(plan) || plan.length === 0) {
-            plan = [
-                prefixStep('text_prefix', query, DEFAULT_K),
-                semanticStep('semantic_fallback', DEFAULT_K)
-            ];
-        }
-
-        if (plan.length > MAX_PLAN_STEPS) {
-            plan = plan.slice(0, MAX_PLAN_STEPS);
-        }
-
-        /* ---- 3. Normalise and sanity-check each step --------------- */
-        for (const step of plan) {
-            // allow camelCase from LLM
-            if (step.queryBody && !step.query_body) {
-                step.query_body = step.queryBody;
-                delete step.queryBody;
-            }
-            if (!step.query_body) {
-                // if still missing, replace with semantic step
-                Object.assign(step, semanticStep(step.step_id || 'auto_semantic'));
-            }
-            // guarantee numeric size
-            if (step.query_body.size == null) step.query_body.size = DEFAULT_K;
-        }
-
-        /* ---- 4. Execute -------------------------------------------- */
-        const execResults = await runPlan(
-            plan,
-            query,
-            indexName,
-            mappings,
-            osClient,
-            embedText
-        );
-
-        /* ---- 5. summarise for next round --------------------------- */
-        const summary = [...execResults.entries()].map(([id, r]) => ({
-            step_id: id,
-            hit_count: r.hits.length
-        }));
-        history.push(...summary);
-
-        /* stop if nothing at all was found */
-        if (summary.every(s => s.hit_count === 0)) {
-            return execResults;
-        }
-
-        /* ask the LLM if coverage is complete ------------------------ */
-        const covered = await checkCoverage({
-            openai,
-            query,
-            history: summary
-        });
-        if (covered) return execResults;
-    }
-
-    console.log(
-        `[planner] gave up after ${MAX_AGENT_ITER} iterations – returning what we have`
-    );
-    return new Map(); // may be empty
-}
-
-/* --------------- LLM call to produce the plan ------------------- */
-async function getPlanFromLLM({ openai, query, history }) {
-    const tools = [
-        {
-            type: 'function',
-            function: {
-                name: PLAN_GEN_FN,
-                description:
-                    'Return only JSON: { "plan":[ {step_id, query_body, purpose, requires_embedding, depends_on, is_final} ] }',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        plan: { type: 'array', items: { type: 'object' } }
-                    },
-                    required: ['plan']
-                }
-            }
-        }
-    ];
-
-    const resp = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-            {
-                role: 'system',
-                content:
-                    'You are building OpenSearch DSL plans. Output ONLY JSON for { "plan": [...] }.'
-            },
-            {
-                role: 'user',
-                content: `User query: ${query}\nPrevious summary: ${JSON.stringify(
-                    history
-                )}`
-            }
-        ],
-        tools,
-        tool_choice: { type: 'function', function: { name: PLAN_GEN_FN } }
+  const history = [];
+  for (let iter = 0; iter < MAX_ITER; ++iter) {
+    const planObj = await buildPlan(openai, query, history);
+    const hits = await runStepsFn({
+      plan: planObj.plan,
+      // entities: planObj.entities,
+      // expansions: planObj.expansions,
+      embed: embedText,
+      os: osClient,
+      index: indexName
     });
 
-    const call = resp.choices?.[0]?.message?.tool_calls?.[0];
-    if (!call?.function?.arguments) return { plan: [] };
+    history.push({
+      // intent: planObj.intent,
+      // entities: planObj.entities,
+      plan: planObj.plan,
+      hit_count: hits.length
+    });
 
-    console.log('[planner] raw function arguments:', call.function.arguments);
-
-    try {
-        return JSON.parse(call.function.arguments);
-    } catch {
-        return { plan: [] };
+    if (hits.length) {
+      const done = await checkCoverage(openai, query, history);
+      if (done) return hits;
     }
+  }
+
+  console.warn('[planAndExecute] max iterations reached with no coverage');
+  return [];
 }
 
-/* ---------------- coverage yes/no helper ------------------------ */
-async function checkCoverage({ openai, query, history }) {
-    const tools = [
-        {
-            type: 'function',
-            function: {
-                name: COVERAGE_FN,
-                description: 'Return { "covered": boolean }',
-                parameters: {
-                    type: 'object',
-                    properties: { covered: { type: 'boolean' } },
-                    required: ['covered']
-                }
-            }
-        }
-    ];
+/**
+ * Checks if the query intent is covered based on history.
+ */
+async function checkCoverage(openai, query, history) {
+  const sys = `
+Evaluate if the query "${query}" intent is covered by the search results:
+${JSON.stringify(history, null, 2)}
+Return JSON: { "covered": boolean }
+Consider whether the intent and key entities are addressed.
+`;
 
-    try {
-        const resp = await openai.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [
-                { role: 'system', content: 'Answer with function call only.' },
-                {
-                    role: 'user',
-                    content: `Query: ${query}\nHit summary: ${JSON.stringify(history)}`
-                }
-            ],
-            tools,
-            tool_choice: { type: 'function', function: { name: COVERAGE_FN } }
-        });
-
-        return JSON.parse(
-            resp.choices[0].message.tool_calls[0].function.arguments
-        ).covered;
-    } catch {
-        return false;
-    }
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: 'Evaluate coverage.' }
+      ],
+      temperature: 0.3
+    });
+    return JSON.parse(resp.choices[0].message.content).covered;
+  } catch {
+    return false; // Continue if coverage check fails
+  }
 }
 
-module.exports = { planAndExecute };
+module.exports = { buildPlan, planAndExecute };

@@ -1,222 +1,176 @@
-/**********************************************************************
- *  index.js  – stateless-JWT + single index
- *********************************************************************/
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { Client } = require('@opensearch-project/opensearch');
 const OpenAI = require('openai');
 const dotenv = require('dotenv');
-const jwt = require('jsonwebtoken');
 const cookie = require('cookie');
+const jwt = require('jsonwebtoken');
 
 const { planAndExecute } = require('./agenticPlanner');
-const runPlan = require('./executePlan');
+const { runSteps } = require('./executePlan');
 
 dotenv.config();
 
-/* ─────────────────── env & constants ─────────────────── */
 const {
     OPENAI_API_KEY,
-    OPENAI_API_URL,
-    JWT_SECRET,                          //  HS256 secret or RSA/EdDSA public key
+    OPENAI_API_URL = 'https://api.openai.com/v1',
     OPENSEARCH_HOST = 'localhost',
     OPENSEARCH_PORT = 9200,
     OPENSEARCH_INDEX_NAME = 'redmine_index',
-    BEARER_TOKEN_FALLBACK,               // keep old header-token for scripts optionally
     OPENAI_EMBED_MODEL = 'text-embedding-ada-002',
     EMBED_DIM = 1536,
     SHARD_COUNT = 1,
     REPLICA_COUNT = 0,
+    DEFAULT_TOP_K = 25,
 } = process.env;
 
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err.stack || err);
-    // graceful shutdown
-    process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // graceful shutdown
-    process.exit(1);
-});
-
-
 const app = express();
-
-const openai = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-    baseURL: OPENAI_API_URL,
-});
-
-
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY, baseURL: OPENAI_API_URL });
 const osClient = new Client({
     node: `http://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}`,
-    ssl: { rejectUnauthorized: false },
+    ssl: { rejectUnauthorized: false }
 });
 
-/* ─────────────────── middleware: JSON ─────────────────── */
 app.use(express.json());
 
-/* ─────────── JWT-only auth ────────── */
-// function getPayloadFromRequest(req) {
-//     // cookie (main auth)
-//     if (req.headers.cookie) {
-//         const cookies = cookie.parse(req.headers.cookie);
-//         if (cookies.auth) {
-//             return jwt.verify(cookies.auth, JWT_SECRET); // throws if invalid / expired
-//         }
-//     }
-//     // fallback: Authorization: Bearer <legacy token>
-//     const auth = req.headers.authorization || '';
-//     if (auth.startsWith('Bearer ')) {
-//         const token = auth.slice(7);
-//         if (BEARER_TOKEN_FALLBACK && token === BEARER_TOKEN_FALLBACK) return { sub: 'legacy' };
-//         return jwt.verify(token, JWT_SECRET);
-//     }
-//     throw new Error('JWT not found');
-// }
-
-// app.use((req, res, next) => {
-//     try {
-//         req.user = getPayloadFromRequest(req);   // { sub, email, role, … }
-//         return next();
-//     } catch (e) {
-//         return res.status(401).json({ error: 'Authentication failed: ' + e.message });
-//     }
-// });
-
-/* ───────────────── index bootstrap (single index) ────────────────── */
+/**
+ * Ensures the OpenSearch index exists with updated mappings.
+ */
 async function ensureIndexExists() {
-    const exists = await osClient.indices.exists({ index: OPENSEARCH_INDEX_NAME });
-    if (exists) {
-        console.log(`Index ${OPENSEARCH_INDEX_NAME} already exists`);
-        return;
-    }
+    try {
+        const exists = await osClient.indices.exists({ index: OPENSEARCH_INDEX_NAME });
+        if (exists.body) {
+            console.log(`Index ${OPENSEARCH_INDEX_NAME} already exists`);
+            return;
+        }
 
-    await osClient.indices.create({
-        index: OPENSEARCH_INDEX_NAME,
-        body: {
-            settings: {
-                index: {
-                    knn: true,
-                    number_of_shards: SHARD_COUNT,
-                    number_of_replicas: REPLICA_COUNT,
+        await osClient.indices.create({
+            index: OPENSEARCH_INDEX_NAME,
+            body: {
+                settings: {
+                    index: {
+                        knn: true,
+                        number_of_shards: SHARD_COUNT,
+                        number_of_replicas: REPLICA_COUNT,
+                    },
                 },
-            },
-            mappings: {
-                properties: {
-                    doc_id: { type: 'keyword' },
-                    doc_type: { type: 'keyword' },
-                    issue_id: { type: 'keyword' },
-                    file_path: { type: 'keyword' },
-                    file_type: { type: 'keyword' },
-                    attachment_content: { type: 'text' },
-                    embedding: {
-                        type: 'knn_vector',
-                        dimension: Number(EMBED_DIM),
-                        method: {
-                            name: 'hnsw',
-                            engine: 'nmslib',
-                            space_type: 'cosinesimil',
-                            parameters: { m: 48, ef_construction: 400 },
+                mappings: {
+                    properties: {
+                        doc_id: { type: 'keyword' },
+                        file_path: { type: 'keyword' },
+                        file_type: { type: 'keyword' },
+                        text_chunk: { type: 'text' },
+                        embedding: {
+                            type: 'knn_vector',
+                            dimension: Number(EMBED_DIM),
+                            method: {
+                                name: 'hnsw',
+                                engine: 'nmslib',
+                                space_type: 'cosinesimil',
+                                parameters: { m: 48, ef_construction: 400 },
+                            },
                         },
                     },
                 },
             },
-        },
-    });
-    console.log(`Created index ${OPENSEARCH_INDEX_NAME}`);
+        });
+        console.log(`Created index ${OPENSEARCH_INDEX_NAME}`);
+    } catch (err) {
+        console.error('Failed to create index:', err.message);
+        throw err;
+    }
 }
 
-/* ───────────────── embedding helper ──────────────────── */
+// Generates embeddings for entities
 async function embedText(text) {
-    if (!text.trim()) return Array(Number(EMBED_DIM)).fill(0);
-    const { data } = await openai.embeddings.create({
-        model: OPENAI_EMBED_MODEL,
-        input: text,
-    });
-    return data[0].embedding;
+    if (!text?.trim()) throw new Error('Empty text for embedding');
+    try {
+        const { data } = await openai.embeddings.create({
+            model: OPENAI_EMBED_MODEL,
+            input: text.slice(0, 14000),
+        });
+        if (data[0].embedding.length !== Number(EMBED_DIM)) {
+            throw new Error(`Invalid embedding dimension: ${data[0].embedding.length}`);
+        }
+        console.log(`Generated embedding for "${text}": length=${data[0].embedding.length}`);
+        return data[0].embedding;
+    } catch (err) {
+        console.error(`Embedding error for "${text}":`, err.message);
+        throw err;
+    }
 }
 
-// main query function - ask() 
-async function ask(query) {
+// Main query function
+async function ask(query, top_k) {
     if (!query?.trim()) throw new Error('Empty query');
+
+    // Check index health and document count
+    try {
+        const health = await osClient.cluster.health();
+        console.log('OpenSearch cluster health:', health.body.status);
+        const count = await osClient.count({ index: OPENSEARCH_INDEX_NAME });
+        console.log(`Index ${OPENSEARCH_INDEX_NAME} - total document count: ${count.body.count}`);
+    } catch (err) {
+        console.error('OpenSearch health check failed:', err.message);
+    }
 
     const mappings = {
         properties: {
             doc_id: { type: 'keyword' },
-            doc_type: { type: 'keyword' },
-            issue_id: { type: 'keyword' },
             file_path: { type: 'keyword' },
             file_type: { type: 'keyword' },
-            attachment_content: { type: 'text' },
+            text_chunk: { type: 'text' },
             embedding: { type: 'knn_vector', dimension: Number(EMBED_DIM) },
         },
     };
 
-    const resMap = await planAndExecute({
+    const hits = await planAndExecute({
         query,
         openai,
         osClient,
         indexName: OPENSEARCH_INDEX_NAME,
         mappings,
         embedText,
-        runPlan,
+        runStepsFn: runSteps,
     });
 
-    // const documents = [];
-    // for (const [, r] of resMap) for (const h of r.hits) documents.push(h._source);
-    const documents = [];
-    for (const [stepId, r] of resMap) {
-        if (!r?.hits || !Array.isArray(r.hits)) {
-            console.warn(`Invalid result in step '${stepId}':`, JSON.stringify(r, null, 2));
-            continue;
-        }
-        for (const h of r.hits) {
-            if (h._source) documents.push(h._source);
-        }
+    const documents = hits.map(h => ({
+        doc_id: h._source.doc_id,
+        file_path: h._source.file_path,
+        file_type: h._source.file_type,
+        text: h._source.text_chunk,
+        score: h._score || 1.0
+    }));
+
+    if (!documents.length) {
+        throw new Error('No matching documents found for the query.');
     }
-    return { documents };
+
+    return { documents: documents.slice(0, top_k || DEFAULT_TOP_K) };
 }
 
-// Global error middleware for HTTP
-app.use((err, req, res, next) => {
-    console.error('Global Express Error Handler:', err.stack || err);
-    res.status(err.status || 500).json({ error: err.message || 'Internal Server Error' });
-});
-
-
-/* ───────────────── REST: POST /ask ────────────────────── */
+// API endpoints
 app.post('/ask', async (req, res) => {
     try {
-        const { query } = req.body;
+        const { query, top_k } = req.body;
         if (!query) return res.status(400).json({ error: 'Missing query' });
-        return res.json(await ask(query));
+        console.log('Processing query:', query);
+        return res.json(await ask(query, top_k));
     } catch (e) {
-        console.error(e);
+        console.error('Ask endpoint error:', e);
         return res.status(500).json({ error: e.message });
     }
 });
 
-/* ───────────────── WebSocket: /ws/ask ────────────────── */
 const wss = new WebSocketServer({ noServer: true });
-
-wss.on('connection', (ws, req) => {
-    // try {
-    //     ws.user = getPayloadFromRequest(req);       // authenticate handshake
-    // } catch (e) {
-    //     ws.close(4401, 'unauthorized');             // 4401 = WS unauthorized
-    //     return;
-    // }
-
-    ws.on('message', async data => {
+wss.on('connection', (ws) => {
+    ws.on('message', async msg => {
         try {
-            const { query } = JSON.parse(data);
+            const { query, top_k } = JSON.parse(msg);
             if (!query) throw new Error('Missing query');
-            ws.send(JSON.stringify(await ask(query)));
+            ws.send(JSON.stringify(await ask(query, top_k)));
         } catch (e) {
-            console.error('WebSocket Message Error:', e.stack || e);
+            console.error('WebSocket error:', e);
             ws.send(JSON.stringify({ error: e.message }));
         } finally {
             ws.close();
@@ -224,26 +178,26 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-/* ─────────── HTTP→WS upgrade (only /ws/ask path) and server start ─────── */
 async function startServer() {
     try {
         await ensureIndexExists();
-        const server = app.listen(8000, () => console.log('API on http://localhost:8000'));
-        server.on('upgrade', (req, socket, head) => {
+        const srv = app.listen(8000, () => console.log('API on http://localhost:8000'));
+        srv.on('upgrade', (req, sock, head) => {
             if (req.url === '/ws/ask') {
-                wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-            } else socket.destroy();
+                wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws, req));
+            } else {
+                sock.destroy();
+            }
         });
     } catch (e) {
-        console.error('Failed to ensure index or start server:', e);
+        console.error('Failed to start server:', e);
         process.exit(1);
     }
 }
 
 startServer();
 
-/* ───────────────── graceful shutdown ─────────────────── */
 process.on('SIGTERM', () => {
     console.log('Shutting down…');
-    server.close(() => process.exit(0));
+    process.exit(0);
 });

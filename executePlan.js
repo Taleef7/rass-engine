@@ -1,168 +1,77 @@
-/**********************************************************************
- * executePlan.js  – run an OpenSearch plan with automatic k-NN recall
- *********************************************************************/
-const { v4: uuidv4 } = require('uuid');
-
-const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
 const DEFAULT_K = Number(process.env.DEFAULT_K || 25);
+const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
+const SCROLL_TTL = '60s';
 
-const VALID_FIELDS = new Set([
-    'doc_id', 'doc_type', 'issue_id',
-    'file_path', 'file_type',
-    'attachment_content', 'text_chunk',
-    'embedding'
-]);
+const log = (...a) => console.log(...a);
+const warn = (...a) => console.warn(...a);
 
-/* ───────────────── utilities ───────────────── */
-// function log(...a) { console.log(...a); }
-function warn(...a) { console.warn(...a); }
+/**
+ * Runs a single knn search with scroll.
+ */
+async function knnSearch(os, index, body) {
+    try {
+        const first = await os.search({ index, body, scroll: SCROLL_TTL });
+        let sid = first.body._scroll_id;
+        const all = [...first.body.hits.hits];
 
-async function storeIdList(os, index, ids, field) {
-    const id = `${field}_list_${uuidv4()}`;
-    await os.index({ index, id, body: { [field]: ids } });
-    return id;
-}
-
-function validate(body) {
-    const walk = o => {
-        for (const k in o) {
-            if (k === 'knn' && o[k].embedding) {
-                const v = o[k].embedding.vector || [];
-                if (v.length !== EMBED_DIM)
-                    throw Error(`knn vector length ${v.length} ≠ ${EMBED_DIM}`);
-            } else if (['match', 'term', 'terms', 'range'].includes(k)) {
-                const f = Object.keys(o[k])[0]?.split('.')[0];
-                if (!VALID_FIELDS.has(f))
-                    warn(`⚠️ unknown field “${f}” (will still send)`);
-            } else if (o[k] && typeof o[k] === 'object') walk(o[k]);
+        while (true) {
+            const nxt = await os.scroll({ scroll_id: sid, scroll: SCROLL_TTL });
+            if (!nxt.body.hits.hits.length) break;
+            all.push(...nxt.body.hits.hits);
+            sid = nxt.body._scroll_id;
         }
-    };
-    walk(body); return true;
-}
-
-function injectVector(body, vector, k) {
-    body.query = { knn: { embedding: { vector, k } } };
-    body.size = body.size || k;
-}
-
-function replaceVectors(obj, vec, k) {
-    if (obj?.knn?.embedding) {
-        obj.knn.embedding.vector = vec;
-        obj.knn.embedding.k = obj.knn.embedding.k || k;
+        await os.clearScroll({ scroll_id: [sid] });
+        const filtered = all.filter(hit => !hit._score || hit._score >= 0.8);
+        log(`[knnSearch] Hits after score filter (>=0.8): ${filtered.length}`);
+        filtered.forEach(hit => log(`[knnSearch] Hit: id=${hit._id}, score=${hit._score}, text=${hit._source.text_chunk?.slice(0, 100)}...`));
+        return filtered;
+    } catch (err) {
+        warn('knnSearch error:', err.message);
+        return [];
     }
-    for (const key in obj)
-        if (obj[key] && typeof obj[key] === 'object')
-            replaceVectors(obj[key], vec, k);
 }
 
-async function injectChainedIds(body, deps, res, index, os) {
-    const set = new Set();
-    for (const d of deps) for (const h of res.get(d)?.hits || [])
-        set.add(h._source.issue_id);
-    if (!set.size) return;
+/**
+ * Executes the ANN plan exactly as planned: 
+ * one HNSW search per 'search_term' in the plan.
+ */
+async function runSteps({ plan, embed, os, index }) {
+    const VEC_CACHE = new Map();               // text → embedding
 
-    const ids = [...set];
-    const clause = ids.length > 1e3
-        ? { terms: { issue_id: { index, id: await storeIdList(os, index, ids, 'issue_ids'), path: 'issue_ids' } } }
-        : { terms: { issue_id: ids } };
-
-    body.query.bool = body.query.bool || {};
-    body.query.bool.filter = [].concat(body.query.bool.filter || [], clause);
-}
-
-async function scrollAll(os, index, body) {
-    const hits = [];
-    let resp = await os.search({ index, body, scroll: '60s' });
-    let sid = resp.body._scroll_id;
-    hits.push(...(resp.body.hits.hits || []));
-
-    while (true) {
-        resp = await os.scroll({ scroll_id: sid, scroll: '60s' });
-        if (!resp.body.hits.hits.length) break;
-        hits.push(...resp.body.hits.hits);
-        sid = resp.body._scroll_id;
-    }
-    await os.clearScroll({ scroll_id: [sid] });
-    return hits;
-}
-
-/* ───────────────── main export ───────────────── */
-async function runPlan(plan, queryText, indexName, mappings, osClient, embedText) {
-    const results = new Map();
-    let queryVec = null;
-
-    /* ------------------------------------------------------------------
-     * Ensure we have a semantic step first.  If the planner already
-     * provided one (requires_embedding:true) we keep the order; otherwise
-     * we prepend our own.
-     * ------------------------------------------------------------------ */
-    const hasKnn = plan.some(s => s.requires_embedding || s.requiresEmbedding);
-    const fullPlan = hasKnn ? plan : [
-        {
-            step_id: 'semantic_recall',
-            purpose: 'initial semantic similarity recall',
-            requires_embedding: true,
-            depends_on: [],
-            query_body: {
-                query: { knn: { embedding: { vector: [], k: DEFAULT_K } } },
-                _source: ['doc_id', 'file_path'],
-                size: DEFAULT_K
-            },
-            is_final: false
-        },
-        ...plan
-    ];
-
-    /* ------------------------------------------------------------------ */
-    for (const step of fullPlan) {
-        // log('\n▶️ [runPlan] step raw:', JSON.stringify(step, null, 2));
-
-        const id = step.step_id || step.stepId || 'step?';
-        const deps = step.depends_on ?? step.dependsOn ?? [];
-        const wantsVec = step.requires_embedding ?? step.requiresEmbedding;
-        let body = step.query_body || step.queryBody;
-        const purpose = step.purpose || 'unspecified';
-
-        if (!body) { warn(`⚠️ ${id} missing query_body – skipped`); continue; }
-        if (deps.some(d => !results.has(d))) { warn(`⚠️ ${id} deps missing – skipped`); continue; }
-
-        const topK = body.size || DEFAULT_K;
-        if (!body.size) body.size = topK;
-
-        /* auto-vector if requested */
-        if (wantsVec) {
-            if (!queryVec) queryVec = await embedText(queryText);
-            replaceVectors(body, queryVec, topK);
+    async function embedOnce(text) {
+        if (!VEC_CACHE.has(text)) {
+            const vec = await embed(text);
+            if (!Array.isArray(vec) || vec.length !== EMBED_DIM)
+                throw new Error(`Bad embedding length for "${text}"`);
+            VEC_CACHE.set(text, vec);
         }
-
-        /* if planner gave a term/match on unknown field → vector fallback */
-        if (!wantsVec) {
-            const q = body.query || {};
-            for (const kw of ['term', 'match', 'terms']) {
-                if (q[kw]) {
-                    const f = Object.keys(q[kw])[0]?.split('.')[0];
-                    if (f && !VALID_FIELDS.has(f)) {
-                        warn(`⚠️ unknown field “${f}” → automatic semantic recall`);
-                        if (!queryVec) queryVec = await embedText(queryText);
-                        injectVector(body, queryVec, topK);
-                    }
-                }
-            }
-        }
-
-        /* chained ids */
-        await injectChainedIds(body, deps, results, indexName, osClient);
-
-        /* final checks + log */
-        validate(body);
-        // log('▶️ [runPlan] Step', id, 'DSL:', JSON.stringify(body, null, 2));
-
-        /* execute */
-        const hits = await scrollAll(osClient, indexName, body);
-        results.set(id, { purpose, hits });
+        return VEC_CACHE.get(text);
     }
 
-    return results;          // may contain zero-hit steps – caller handles
+    const bestById = new Map();                // _id → best-scoring hit
+
+    for (const step of plan) {
+        console.log(`[runSteps] Processing step: ${JSON.stringify(step)}`);
+        const term = step.search_term?.trim();          // single term
+        const vector = await embedOnce(term);            // embed as-is
+
+        const k = step.knn_k || DEFAULT_K;
+        const body = {
+            size: k,
+            _source: ['doc_id', 'file_path', 'file_type', 'text_chunk'],
+            query: { knn: { embedding: { vector, k } } }
+        };
+
+        const { body: res } = await knnSearch(os, index, body);
+        console.log("Result=", res);
+        for (const h of res?.hits?.hits || []) {
+            const prev = bestById.get(h._id);
+            if (!prev || h._score > prev._score) bestById.set(h._id, h);
+        }
+    }
+
+    return Array.from(bestById.values());
 }
 
-module.exports = runPlan;
+
+module.exports = { runSteps };
