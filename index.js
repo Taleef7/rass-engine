@@ -24,7 +24,7 @@ const {
     OPENSEARCH_INDEX_NAME = 'redmine_index',
     BEARER_TOKEN_FALLBACK,               // keep old header-token for scripts optionally
     OPENAI_EMBED_MODEL = 'text-embedding-ada-002',
-    EMBED_DIM = 1024,
+    EMBED_DIM = 1536,
     SHARD_COUNT = 1,
     REPLICA_COUNT = 0,
 } = process.env;
@@ -165,8 +165,18 @@ async function ask(query) {
         runPlan,
     });
 
+    // const documents = [];
+    // for (const [, r] of resMap) for (const h of r.hits) documents.push(h._source);
     const documents = [];
-    for (const [, r] of resMap) for (const h of r.hits) documents.push(h._source);
+    for (const [stepId, r] of resMap) {
+        if (!r?.hits || !Array.isArray(r.hits)) {
+            console.warn(`Invalid result in step '${stepId}':`, JSON.stringify(r, null, 2));
+            continue;
+        }
+        for (const h of r.hits) {
+            if (h._source) documents.push(h._source);
+        }
+    }
     return { documents };
 }
 
