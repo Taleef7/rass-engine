@@ -14,7 +14,7 @@ const VALID_FIELDS = new Set([
 ]);
 
 /* ───────────────── utilities ───────────────── */
-function log(...a) { console.log(...a); }
+// function log(...a) { console.log(...a); }
 function warn(...a) { console.warn(...a); }
 
 async function storeIdList(os, index, ids, field) {
@@ -115,7 +115,7 @@ async function runPlan(plan, queryText, indexName, mappings, osClient, embedText
 
     /* ------------------------------------------------------------------ */
     for (const step of fullPlan) {
-        log('\n▶️ [runPlan] step raw:', JSON.stringify(step, null, 2));
+        // log('\n▶️ [runPlan] step raw:', JSON.stringify(step, null, 2));
 
         const id = step.step_id || step.stepId || 'step?';
         const deps = step.depends_on ?? step.dependsOn ?? [];
@@ -155,7 +155,7 @@ async function runPlan(plan, queryText, indexName, mappings, osClient, embedText
 
         /* final checks + log */
         validate(body);
-        log('▶️ [runPlan] Step', id, 'DSL:', JSON.stringify(body, null, 2));
+        // log('▶️ [runPlan] Step', id, 'DSL:', JSON.stringify(body, null, 2));
 
         /* execute */
         const hits = await scrollAll(osClient, indexName, body);
