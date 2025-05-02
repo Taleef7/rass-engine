@@ -134,6 +134,8 @@ async function ask(query, top_k) {
         runStepsFn: runSteps,
     });
 
+    console.log(`Found ${hits} - for query "${query}"`);
+
     const documents = hits.map(h => ({
         doc_id: h._source.doc_id,
         file_path: h._source.file_path,

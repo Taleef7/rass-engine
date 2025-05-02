@@ -2,8 +2,6 @@ const MAX_ITER = 6;
 const DEFAULT_K = Number(process.env.DEFAULT_K || 25);
 const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
 
-const log = (...a) => console.log(...a);
-const warn = (...a) => console.warn(...a);
 
 /**
  * Convert a natural-language request into an ANN-only plan
@@ -14,7 +12,7 @@ const warn = (...a) => console.warn(...a);
  *   intent:   string[],
  *   entities: [{ text, type }],
  *   expansions: { <entity>: string[] },
- *   plan: [{ step_id, search_term, knn_k, is_final }]
+ *   plan: [{ step_id, search_term, knn_k }]
  * }
  */
 async function buildPlan(openai, query, history = []) {

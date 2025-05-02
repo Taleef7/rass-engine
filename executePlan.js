@@ -21,8 +21,8 @@ async function knnSearch(os, index, body) {
             sid = nxt.body._scroll_id;
         }
         await os.clearScroll({ scroll_id: [sid] });
-        const filtered = all.filter(hit => !hit._score || hit._score >= 0.8);
-        log(`[knnSearch] Hits after score filter (>=0.8): ${filtered.length}`);
+        const filtered = all.filter(hit => !hit._score || hit._score >= 0.84);
+        log(`[knnSearch] Hits after score filter (>=0.84): ${filtered.length}`);
         filtered.forEach(hit => log(`[knnSearch] Hit: id=${hit._id}, score=${hit._score}, text=${hit._source.text_chunk?.slice(0, 100)}...`));
         return filtered;
     } catch (err) {
@@ -62,12 +62,14 @@ async function runSteps({ plan, embed, os, index }) {
             query: { knn: { embedding: { vector, k } } }
         };
 
-        const { body: res } = await knnSearch(os, index, body);
-        console.log("Result=", res);
-        for (const h of res?.hits?.hits || []) {
+        const res = await knnSearch(os, index, body);
+        // res.forEach(hit => log(`[knnSearch] Hit: id=${hit._id}, score=${hit._score}, text=${hit._source.text_chunk?.slice(0, 100)}...`));
+
+        for (const h of res || []) {
             const prev = bestById.get(h._id);
             if (!prev || h._score > prev._score) bestById.set(h._id, h);
         }
+
     }
 
     return Array.from(bestById.values());
