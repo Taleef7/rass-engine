@@ -17,37 +17,23 @@ const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
  */
 async function buildPlan(openai, query, history = []) {
   const sysPrompt = `
-You are an expert OpenSearch strategist.  
-The index schema is **immutable**:
+You are an expert OpenSearch strategist.  Return exactly a single JSON object matching the function signature 'build_plan'.
 
-mappings: {
-  properties: {
-    doc_id     : { type: keyword },
-    file_path  : { type: keyword },
-    file_type  : { type: keyword },
-    text_chunk : { type: text    },
-    embedding  : { type: knn_vector, dimension: ${EMBED_DIM},
-                   method: { name: hnsw, engine: nmslib,
-                             space_type: cosinesimil,
-                             parameters: { m: 48, ef_construction: 400 } } }
-  }
+### Output format
+\`\`\`json
+{
+  "intent": ["find documents"],
+  "entities":[{"text":"...","type":"..."}],
+  "expansions": {"...":["...",...]},
+  "plan":[
+     {"step_id":"e1","search_term":"...","knn_k":10},
+     ...
+  ]
 }
-
-### Your job
-1.  Detect the user **intent** (one short phrase).
-2.  Extract **named entities** – label each as
-    PERSON/PROPER NOUN, DATE, PLACE, MEDICAL_COND, ORG, ID, OTHER_TERM.
-3.  Produce up to three concise **expansions** per entity
-    (skip people, IDs, or ultra-specific proper nouns).
-4.  Craft an ANN-only **plan**:
-    • One 'search_term' per step (entity or expansion).  
-    • Choose 'knn_k' (10 for specific, up to 50 for broad).
-
-### Response
-Return **ONLY** valid JSON (no markdown). Use the schema above.
+\`\`\`
 
 ### Examples
-(abridged for brevity – note the 'search_term' key and look at the first example for the JSON output structure)
+(abridged for brevity – note the 'search_term' key and look at the first two examples for the JSON output structure again)
 
 1. Query: *"get me records for Juli and the documents having the mention of terms containing Borne"*  
    → intent: "find documents"
@@ -115,18 +101,68 @@ Current Query: ${query}
 History: ${JSON.stringify(history)}
 `.trim();
 
+  const functions = [
+    {
+      name: "build_plan",
+      description: "Extract intent, entities, expansions, and produce an ANN plan",
+      parameters: {
+        type: "object",
+        properties: {
+          intent: {
+            type: "array", items: { type: "string" },
+            description: "Detected intent of the user"
+          },
+          // entities: {
+          //   type: "array",
+          //   items: {
+          //     type: "object",
+          //     properties: { text: { type: "string" }, type: { type: "string" } },
+          //     required: ["text", "type"]
+          //   },
+          //   description: "Named entities extracted from the query"
+          // },
+          // expansions: {
+          //   type: "object",
+          //   additionalProperties: { type: "array", items: { type: "string" } },
+          //   description: "Optional synonyms/expansions for each entity"
+          // },
+          plan: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                step_id: { type: "string" },
+                search_term: { type: "string" },
+                knn_k: { type: "integer" }
+              },
+              required: ["step_id", "search_term", "knn_k"]
+            },
+            description: "Ordered ANN search steps containing the search term (extracted named entity) and the number of nearest neighbors to return"
+          }
+        },
+        required: ["intent", "plan"]
+      }
+    }
+  ];
+
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o',
     temperature: 0.3,
-    max_tokens: 1500,
+    // max_tokens: 1500,
     messages: [
       { role: 'system', content: sysPrompt },
-      { role: 'user', content: `Query: ${query}\nHistory: ${JSON.stringify(history)}` }
-    ]
+      { role: 'user', content: `Please build the plan for "${query}"` }
+    ],
+    functions,
+    function_call: { name: "build_plan" },
   });
 
+
   try {
-    return JSON.parse(resp?.choices[0]?.message?.content);
+    const msg = resp.choices[0].message;
+    if (msg.function_call?.name === "build_plan") {
+      return JSON.parse(msg.function_call.arguments);
+    }
   } catch (e) {
     console.warn('[LLM] bad JSON, falling back:', e.message);
     return {                                // emergency single-step plan
@@ -136,6 +172,14 @@ History: ${JSON.stringify(history)}
       plan: [{ step_id: "e1", search_term: query, knn_k: DEFAULT_K, is_final: true }]
     };
   }
+
+  // fallback
+  return {
+    intent: ["find documents"],
+    entities: [{ text: query, type: "OTHER_TERM" }],
+    expansions: { [query]: [] },
+    plan: [{ step_id: "e1", search_term: query, knn_k: DEFAULT_K }]
+  };
 }
 
 
