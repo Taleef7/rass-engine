@@ -32,8 +32,11 @@ async function knnSearch(os, index, body) {
 }
 
 /**
- * Executes the ANN plan exactly as planned: 
- * one HNSW search per 'search_term' in the plan.
+ * Executes the ANN plan exactly as planned:
+ *  - run one HNSW search per 'search_term'
+ *  - keep each step’s hits in descending score order
+ *  - then interleave: step1[0], step2[0], ..., stepN[0], step1[1], step2[1], ...
+ *  - dedupe by _id, preserving first appearance
  */
 async function runSteps({ plan, embed, os, index }) {
     const VEC_CACHE = new Map();               // text → embedding
@@ -48,30 +51,39 @@ async function runSteps({ plan, embed, os, index }) {
         return VEC_CACHE.get(text);
     }
 
-    const bestById = new Map();                // _id → best-scoring hit
-
+    // collect each step’s raw hits
+    const perStepHits = [];
     for (const step of plan) {
-        console.log(`[runSteps] Processing step: ${JSON.stringify(step)}`);
-        const term = step.search_term?.trim();          // single term
-        const vector = await embedOnce(term);            // embed as-is
-
+        // console.log(`[runSteps] Processing step: ${JSON.stringify(step)}`);
+        const term = step.search_term?.trim();
+        const vector = await embedOnce(term);
         const k = step.knn_k || DEFAULT_K;
         const body = {
             size: k,
-            _source: ['doc_id', 'file_path', 'file_type'],
+            _source: ['doc_id', 'file_path', 'file_type', 'text_chunk'],
             query: { knn: { embedding: { vector, k } } }
         };
 
-        const res = await knnSearch(os, index, body);
-
-        for (const h of res || []) {
-            const prev = bestById.get(h._id);
-            if (!prev || h._score > prev._score) bestById.set(h._id, h);
-        }
-
+        const hits = await knnSearch(os, index, body);
+        perStepHits.push(hits);
     }
 
-    return Array.from(bestById.values());
+    // interleave them
+    const interleaved = [];
+    const seen = new Set();
+    const maxLen = Math.max(...perStepHits.map(h => h.length), 0);
+
+    for (let i = 0; i < maxLen; i++) {
+        for (const hits of perStepHits) {
+            const hit = hits[i];
+            if (hit && !seen.has(hit._id)) {
+                seen.add(hit._id);
+                interleaved.push(hit);
+            }
+        }
+    }
+
+    return interleaved;
 }
 
 

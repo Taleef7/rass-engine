@@ -173,8 +173,6 @@ async function planAndExecute({
     });
 
     history.push({
-      // intent: planObj.intent,
-      // entities: planObj.entities,
       plan: planObj.plan,
       hit_count: hits.length
     });
