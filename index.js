@@ -154,7 +154,7 @@ app.post('/ask', async (req, res) => {
     try {
         const { query, top_k } = req.body;
         if (!query) return res.status(400).json({ error: 'Missing query' });
-        console.log('Processing query:', query);
+        console.log('--------------------------------- Processing query: ', query, '-------------------------------');
         return res.json(await ask(query, top_k));
     } catch (e) {
         console.error('Ask endpoint error:', e);
