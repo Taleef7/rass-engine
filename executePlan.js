@@ -21,8 +21,8 @@ async function knnSearch(os, index, body) {
             sid = nxt.body._scroll_id;
         }
         await os.clearScroll({ scroll_id: [sid] });
-        const filtered = all.filter(hit => !hit._score || hit._score >= 0.84);
-        log(`[knnSearch] Hits after score filter (>=0.84): ${filtered.length}`);
+        const filtered = all.filter(hit => !hit._score || hit._score >= 0.86);
+        log(`[knnSearch] Hits after score filter (>=0.86): ${filtered.length}`);
         filtered.forEach(hit => log(`[knnSearch] Hit: id=${hit._id}, score=${hit._score}`));
         return filtered;
     } catch (err) {
