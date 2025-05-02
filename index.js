@@ -134,17 +134,17 @@ async function ask(query, top_k) {
         runStepsFn: runSteps,
     });
 
+    if (!hits || !hits.length) {
+        throw new Error('No matching documents found for the query.');
+    }
+
     const documents = hits.map(h => ({
         doc_id: h._source.doc_id,
         file_path: h._source.file_path,
         file_type: h._source.file_type,
         // text: h._source.text_chunk,
-        score: h._score || 1.0
+        score: h._score || 0
     }));
-
-    if (!documents.length) {
-        throw new Error('No matching documents found for the query.');
-    }
 
     return { documents: documents.slice(0, top_k || DEFAULT_TOP_K) };
 }
