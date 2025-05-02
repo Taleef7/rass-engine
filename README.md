@@ -4,6 +4,24 @@ A dynamic, LLM-based Retrieval-Augmented Generation (RAG) or Retrieval-Augmented
 
 ---
 
+``` mermaid
+graph TD
+    A[User Query via REST or WebSocket] --> B[Planner using GPT-4o]
+    B --> C[Intent and Entity Extraction]
+    C --> D[ANN Plan Generation]
+    D --> E[Plan and Execute Loop]
+    E --> F[Embed Search Terms via OpenAI]
+    F --> G[Run ANN Search with OpenSearch]
+    G --> H[Filter Hits by Score Threshold]
+    H --> I[Group Hits Round-Robin]
+    I --> J[Check Coverage via LLM]
+    J --> K{Is Coverage Sufficient?}
+    K -->|Yes| L[Return Top-k Grouped Results]
+    K -->|No| E
+    L --> M[Send JSON or WebSocket Response]
+
+```
+
 ## ⚙️ Core Features
 
 * **Agentic/LLM-based Planner + Executor Loop**
