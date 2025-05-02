@@ -180,8 +180,7 @@ async function planAndExecute({
     });
 
     if (hits.length) {
-      const done = await checkCoverage(openai, query, history);
-      if (done) return hits;
+      return hits;
     }
   }
 
@@ -189,30 +188,5 @@ async function planAndExecute({
   return [];
 }
 
-/**
- * Checks if the query intent is covered based on history.
- */
-async function checkCoverage(openai, query, history) {
-  const sys = `
-Evaluate if the query "${query}" intent is covered by the search results:
-${JSON.stringify(history, null, 2)}
-Return JSON: { "covered": boolean }
-Consider whether the intent and key entities are addressed.
-`;
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: 'Evaluate coverage.' }
-      ],
-      temperature: 0.3
-    });
-    return JSON.parse(resp.choices[0].message.content).covered;
-  } catch {
-    return false; // Continue if coverage check fails
-  }
-}
 
 module.exports = { buildPlan, planAndExecute };
