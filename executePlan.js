@@ -1,5 +1,7 @@
 const DEFAULT_K = Number(process.env.DEFAULT_K || 25);
 const EMBED_DIM = Number(process.env.EMBED_DIM || 1536);
+const envScoreThreshold = parseFloat(process.env.OPENSEARCH_SCORE_THRESHOLD);
+const OPENSEARCH_SCORE_THRESHOLD = !isNaN(envScoreThreshold) ? envScoreThreshold : 0.78; // More robust check
 const SCROLL_TTL = '60s';
 
 const log = (...a) => console.log(...a);
@@ -21,8 +23,10 @@ async function knnSearch(os, index, body) {
             sid = nxt.body._scroll_id;
         }
         await os.clearScroll({ scroll_id: [sid] });
-        const filtered = all.filter(hit => !hit._score || hit._score >= 0.86);
-        log(`[knnSearch] Hits after score filter (>=0.86): ${filtered.length}`);
+        // === MODIFIED LINES START ===
+        const filtered = all.filter(hit => !hit._score || hit._score >= OPENSEARCH_SCORE_THRESHOLD);
+        log(`[knnSearch] Hits after score filter (>=${OPENSEARCH_SCORE_THRESHOLD}): ${filtered.length}`);
+        // === MODIFIED LINES END ===
         filtered.forEach(hit => log(`[knnSearch] Hit: id=${hit._id}, score=${hit._score}`));
         return filtered;
     } catch (err) {

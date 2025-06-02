@@ -1,15 +1,15 @@
+const dotenv = require('dotenv');
+dotenv.config();
+
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { Client } = require('@opensearch-project/opensearch');
 const OpenAI = require('openai');
-const dotenv = require('dotenv');
 const cookie = require('cookie');
 const jwt = require('jsonwebtoken');
 
 const { planAndExecute } = require('./agenticPlanner');
 const { runSteps } = require('./executePlan');
-
-dotenv.config();
 
 const {
     OPENAI_API_KEY,
